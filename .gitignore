@@ -1,0 +1,20 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+*.egg
+
+# Environment configuration (sensitive)
+*.env
+*.venv
+
+# OS-specific
+.DS_Store
+Thumbs.db
+
+# folders
+maintenance/
+backups/
+
