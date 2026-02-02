@@ -242,6 +242,25 @@ These appear in the **Outputs** panel when you click each node run in LangSmith.
 
 `collect_runs()` does not change what is traced. It simply **captures the Run IDs** created inside the context so the UI can link you to the root LangGraph run.
 
+#### Root run vs. many run IDs (why the UI links to one `run_id`)
+
+A single click in the UI produces **many LangSmith runs**:
+
+- 1 **root** run (the overall LangGraph execution)
+- child runs for each node (`retrieve`, `grade_documents`, `rewrite_query`, `generate`)
+- nested runs for the components inside nodes (retriever calls, LLM calls, chains, etc.)
+
+LangSmith stores these as a **tree** using a `parent_run_id` relationship.  
+That’s why the Streamlit UI only needs to link to **one** ID: the **root run ID**.  
+When you open the root run in LangSmith, you can expand and inspect the entire run tree.
+
+In `ui.py`, we use `collect_runs()` to collect runs created inside the context, then select the root run by:
+- preferring runs with `parent_run_id == None` (no parent)
+- if multiple roots exist, preferring the run named `"LangGraph"`
+- otherwise falling back to the earliest root run
+
+This is more robust than taking `cb.traced_runs[0]`, because `cb.traced_runs` can include multiple runs (and potentially multiple independent roots) depending on what executed inside the context.
+
 ### Privacy note
 
 If tracing is enabled, LangSmith may store prompts/outputs for LLM calls and intermediate values for runs. This repo’s additional debug fields are **metadata-only**, but the LLM calls themselves may still include text depending on your LangSmith settings and tracer configuration.

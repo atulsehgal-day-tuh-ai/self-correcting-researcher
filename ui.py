@@ -14,6 +14,8 @@ Notes:
   `python -m streamlit run .\\ui.py`
 """
 
+from __future__ import annotations
+
 import streamlit as st
 
 from dotenv import load_dotenv
@@ -31,6 +33,48 @@ from src.graph import build_graph
 
 # Setup LangSmith Client (to generate trace URLs).
 client = Client()
+
+def _select_root_run_id(traced_runs) -> str | None:
+    """
+    Pick the *root* LangSmith run ID from a `collect_runs()` context.
+
+    Why this exists:
+    - A single graph execution produces MANY runs (root + node runs + nested LLM/retriever runs).
+    - LangSmith stores these runs as a *tree* via parent/child relationships.
+    - To link to “the whole trace”, we want the ROOT run (the run with no parent).
+
+    What `collect_runs()` gives us:
+    - `cb.traced_runs` is a list of run objects created during the context.
+    - Depending on what ran inside the context, this list may contain:
+      - multiple child runs
+      - potentially multiple independent root runs (if you ran multiple graphs/chains)
+
+    Strategy:
+    1) Prefer runs that have no parent (`parent_run_id is None`).
+    2) If multiple roots exist, prefer the one named "LangGraph" (common for LangGraph root).
+    3) Otherwise, fall back to the earliest root (or first captured run if no parent info exists).
+    """
+    if not traced_runs:
+        return None
+
+    # Root runs usually have no parent_run_id (None). Some objects may not expose this field.
+    roots = [r for r in traced_runs if getattr(r, "parent_run_id", None) in (None, "")]
+
+    if not roots:
+        # Fallback: if parent metadata isn't present, use the first captured run.
+        return getattr(traced_runs[0], "id", None)
+
+    # Prefer the LangGraph root run if present.
+    for r in roots:
+        if getattr(r, "name", "") == "LangGraph":
+            return getattr(r, "id", None)
+
+    # Otherwise: prefer earliest root (best-effort), else just take the first.
+    def _sort_key(r):
+        return getattr(r, "start_time", None) or ""
+
+    roots_sorted = sorted(roots, key=_sort_key)
+    return getattr(roots_sorted[0], "id", None)
 
 st.set_page_config(page_title="Self-Correcting Researcher", page_icon="🤖")
 
@@ -53,9 +97,11 @@ if submitted and text:
     final_generation = ""
     run_id = None
 
-    # `collect_runs()` captures the root LangGraph run ID so we can link to the
-    # trace in LangSmith. This is independent from the node-level tracing that
-    # happens automatically when LangChain tracing is enabled.
+    # `collect_runs()` does NOT decide what is traced.
+    # Tracing happens automatically when LANGCHAIN_TRACING_V2 is enabled.
+    #
+    # `collect_runs()` is just a convenience wrapper that collects *run objects*
+    # created inside this context so we can extract a root run id and link to it.
     with collect_runs() as cb:
         
         # Run the graph stream and update the UI as nodes finish.
@@ -76,9 +122,10 @@ if submitted and text:
                     status_container.write("💡 Generating final answer...")
                     final_generation = value["generation"]
         
-        # Capture the Run ID from the first tracked run (the root).
-        if cb.traced_runs:
-            run_id = cb.traced_runs[0].id
+        # IMPORTANT:
+        # `cb.traced_runs` may contain many runs. We pick the ROOT run because
+        # it expands to the full trace tree in the LangSmith UI.
+        run_id = _select_root_run_id(cb.traced_runs)
 
     status_container.update(label="Finished!", state="complete", expanded=False)
 
