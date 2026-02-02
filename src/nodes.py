@@ -50,22 +50,34 @@ llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
 # --- NODES (Keep these exactly the same) ---
 
+def _doc_meta(d, idx: int) -> dict:
+    """Metadata-only representation of a Document for safe tracing/logging."""
+    meta = getattr(d, "metadata", None) or {}
+    # Common keys from loaders include 'source' (URL/path). Keep it flexible.
+    out = {"index": idx}
+    if isinstance(meta, dict):
+        # Shallow copy of metadata only (no page_content)
+        out.update(meta)
+    return out
+
 def retrieve(state: GraphState):
     print(f"---RETRIEVE (Attempt: {state.get('retry_count', 0)})---")
     question = state["question"]
     documents = retriever.invoke(question)
-    return {"documents": documents, "question": question}
+    retrieved_docs_meta = [_doc_meta(d, idx) for idx, d in enumerate(documents)]
+    return {"documents": documents, "question": question, "retrieved_docs_meta": retrieved_docs_meta}
 
 def generate(state: GraphState):
     print("---GENERATE---")
     question = state["question"]
     documents = state["documents"]
+    used_docs_meta = [_doc_meta(d, idx) for idx, d in enumerate(documents)]
     prompt = ChatPromptTemplate.from_template(
         "Answer the question based only on the following context:\n\n{context}\n\nQuestion: {question}"
     )
     chain = prompt | llm | StrOutputParser()
     generation = chain.invoke({"context": documents, "question": question})
-    return {"generation": generation}
+    return {"generation": generation, "used_docs_meta": used_docs_meta}
 
 def grade_documents(state: GraphState):
     print("---CHECK RELEVANCE---")
@@ -75,7 +87,9 @@ def grade_documents(state: GraphState):
     
     system = """You are a grader assessing relevance of a retrieved document to a user question. 
     If the document contains keyword(s) or semantic meaning related to the question, grade it as 'yes'. 
-    Otherwise grade it as 'no'."""
+    Otherwise grade it as 'no'.
+
+    Output MUST be exactly one token: 'yes' or 'no'. No punctuation, no explanation."""
     
     grade_prompt = ChatPromptTemplate.from_messages([
         ("system", system),
@@ -85,17 +99,31 @@ def grade_documents(state: GraphState):
     
     filtered_docs = []
     relevant_found = False
+    doc_grades = []
     
-    for d in documents:
+    for idx, d in enumerate(documents):
         score = grader_llm.invoke({"question": question, "document": d.page_content})
-        if "yes" in score.lower():
+        normalized = (score or "").strip().lower()
+        # Be tolerant to minor punctuation/formatting despite instructions.
+        first_token = (normalized.split()[0] if normalized else "").strip(".,;:!?\"'")
+        passed = first_token == "yes"
+        doc_grades.append(
+            {
+                "index": idx,
+                "passed": passed,
+                "grade": first_token or normalized,
+                # metadata-only (no text)
+                **_doc_meta(d, idx),
+            }
+        )
+        if passed:
             filtered_docs.append(d)
             relevant_found = True
             
     if relevant_found:
-        return {"documents": filtered_docs}
+        return {"documents": filtered_docs, "doc_grades": doc_grades}
     else:
-        return {"documents": [], "retry_count": retry_count + 1}
+        return {"documents": [], "retry_count": retry_count + 1, "doc_grades": doc_grades}
 
 def rewrite_query(state: GraphState):
     print("---REWRITE QUERY---")

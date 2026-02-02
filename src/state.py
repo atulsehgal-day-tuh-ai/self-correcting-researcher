@@ -1,4 +1,4 @@
-from typing import List, TypedDict
+from typing import Any, List, NotRequired, TypedDict
 from langchain_core.documents import Document
 
 class GraphState(TypedDict):
@@ -15,3 +15,9 @@ class GraphState(TypedDict):
     generation: str
     documents: List[Document]
     retry_count: int
+
+    # --- Debug fields for tracing (LangSmith) ---
+    # Metadata-only (no document text) so it’s safe to log.
+    retrieved_docs_meta: NotRequired[List[dict[str, Any]]]
+    doc_grades: NotRequired[List[dict[str, Any]]]
+    used_docs_meta: NotRequired[List[dict[str, Any]]]
