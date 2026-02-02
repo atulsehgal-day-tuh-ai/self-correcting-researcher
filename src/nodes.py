@@ -1,16 +1,55 @@
+"""
+LangGraph node implementations.
+
+This module contains:
+- Vector store setup (ChromaDB persistence on disk via `./chroma_db`)
+- The four node functions used by the LangGraph workflow:
+  1) `retrieve`        - fetch candidate chunks from the vector store
+  2) `grade_documents` - LLM-based relevance filter (keeps only "good" chunks)
+  3) `rewrite_query`   - LLM-based query rewrite if retrieval is bad
+  4) `generate`        - final answer generation (RAG)
+
+Tracing (LangSmith):
+- When LangChain tracing is enabled, each node appears as a run, with nested runs
+  for `VectorStoreRetriever` and `ChatOpenAI` calls.
+- This repo also emits *metadata-only* debug fields to help you understand what
+  was retrieved/graded/used without logging raw document text:
+  - `retrieved_docs_meta` (from `retrieve`)
+  - `doc_grades`          (from `grade_documents`)
+  - `used_docs_meta`      (from `generate`)
+"""
+
+from __future__ import annotations
+
 import os
-from langchain_community.document_loaders import WebBaseLoader
+
 from langchain_chroma import Chroma
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_community.document_loaders import WebBaseLoader
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_text_splitters import RecursiveCharacterTextSplitter
+
 from src.state import GraphState
 
-# --- LAZY LOADING PATTERN ---
-# We define a function to get the data, but we don't RUN it immediately.
+PERSIST_DIR = "./chroma_db"
+
+# --- Lazy loading pattern ---
+# We define a function to build/load the vector store, but we delay any heavy work
+# until the module is imported and `retriever` is initialized.
 def get_retriever():
-    PERSIST_DIR = "./chroma_db"
+    """
+    Create or load a persistent Chroma vector store and return a retriever.
+
+    Behavior:
+    - If `./chroma_db` exists and has items, reuse it (fast startup).
+    - If it exists but is empty (corrupt/incomplete), rebuild it.
+    - If it does not exist, build it by downloading Lilian Weng's agent blog post,
+      splitting into chunks, embedding, and persisting to disk.
+
+    Returns:
+        A LangChain retriever implementing `.invoke(query)` -> List[Document].
+    """
     embedding = OpenAIEmbeddings()
     
     # Check if DB exists
@@ -27,7 +66,7 @@ def get_retriever():
             print("--- LOADING EXISTING VECTOR STORE ---")
             return vectorstore.as_retriever()
 
-    # --- CREATION LOGIC (Runs if missing OR empty) ---
+    # --- Creation logic (runs if missing OR empty) ---
     print("--- BUILDING VECTOR STORE ---")
     loader = WebBaseLoader("https://lilianweng.github.io/posts/2023-06-23-agent/")
     docs = loader.load()
@@ -42,16 +81,20 @@ def get_retriever():
     return vectorstore.as_retriever()
 
 
-# Initialize objects
-# Note: We call get_retriever() here, but because it's now a function,
-# Python handles the memory management better for Streamlit.
+# --- Shared objects ---
+# These are module-level singletons so every node invocation reuses the same
+# retriever + model configuration (also makes LangSmith traces consistent).
 retriever = get_retriever()
 llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
 
-# --- NODES (Keep these exactly the same) ---
-
 def _doc_meta(d, idx: int) -> dict:
-    """Metadata-only representation of a Document for safe tracing/logging."""
+    """
+    Metadata-only representation of a `Document` for safe tracing/logging.
+
+    Important:
+    - We intentionally do NOT include `Document.page_content` here.
+      This keeps traces lightweight and avoids leaking content in logs.
+    """
     meta = getattr(d, "metadata", None) or {}
     # Common keys from loaders include 'source' (URL/path). Keep it flexible.
     out = {"index": idx}
@@ -61,6 +104,16 @@ def _doc_meta(d, idx: int) -> dict:
     return out
 
 def retrieve(state: GraphState):
+    """
+    Retrieve candidate documents for the current question.
+
+    Inputs (from GraphState):
+        - question: user question (possibly rewritten)
+
+    Outputs (state update):
+        - documents: List[Document] retrieved from the vector store
+        - retrieved_docs_meta: metadata-only list to aid LangSmith debugging
+    """
     print(f"---RETRIEVE (Attempt: {state.get('retry_count', 0)})---")
     question = state["question"]
     documents = retriever.invoke(question)
@@ -68,6 +121,16 @@ def retrieve(state: GraphState):
     return {"documents": documents, "question": question, "retrieved_docs_meta": retrieved_docs_meta}
 
 def generate(state: GraphState):
+    """
+    Generate the final answer from the filtered documents.
+
+    This is the final step in the graph unless the retry limit triggers a
+    "generate anyway" fallback.
+
+    Outputs (state update):
+        - generation: final answer text
+        - used_docs_meta: metadata-only list of docs used as context
+    """
     print("---GENERATE---")
     question = state["question"]
     documents = state["documents"]
@@ -80,6 +143,20 @@ def generate(state: GraphState):
     return {"generation": generation, "used_docs_meta": used_docs_meta}
 
 def grade_documents(state: GraphState):
+    """
+    Grade retrieved documents for relevance to the question.
+
+    This node implements the "self-correction" gate:
+    - It runs an LLM-based binary relevance check per retrieved chunk.
+    - If at least one chunk is relevant: keep only those chunks.
+    - If none are relevant: clear documents and increment `retry_count` so the
+      graph routes to `rewrite_query`.
+
+    Outputs (state update):
+        - documents: filtered list (may be empty)
+        - retry_count: incremented if nothing relevant was found
+        - doc_grades: per-doc grading results (metadata-only) for LangSmith
+    """
     print("---CHECK RELEVANCE---")
     question = state["question"]
     documents = state["documents"]
@@ -126,6 +203,14 @@ def grade_documents(state: GraphState):
         return {"documents": [], "retry_count": retry_count + 1, "doc_grades": doc_grades}
 
 def rewrite_query(state: GraphState):
+    """
+    Rewrite the question to improve retrieval quality.
+
+    This node is only used when `grade_documents` finds no relevant documents.
+
+    Output (state update):
+        - question: rewritten question that better matches the knowledge base
+    """
     print("---REWRITE QUERY---")
     question = state["question"]
     msg = [

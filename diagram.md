@@ -1,33 +1,51 @@
+## Architecture & Flow
+
+This doc is the single source of truth for how the repo fits together.
+
+### High-level control flow (LangGraph)
+
 ```mermaid
-graph TD
-    %% NODES
-    Start([main.py: app.stream]) --> NodeRetrieve
-    
-    subgraph "The Loop (LangGraph)"
-        NodeRetrieve[<b>Node: retrieve</b><br>File: src/nodes.py<br>Lib: ChromaDB / VectorStore]
-        NodeGrade[<b>Node: grade_documents</b><br>File: src/nodes.py<br>Lib: ChatOpenAI / LLM]
-        NodeRewrite[<b>Node: rewrite_query</b><br>File: src/nodes.py<br>Lib: ChatOpenAI / LLM]
-        NodeGenerate[<b>Node: generate</b><br>File: src/nodes.py<br>Lib: ChatOpenAI / RAG Chain]
-    end
+flowchart TD
+    StartNode["Start (main.py/ui.py): app.stream(inputs)"] --> RetrieveNode["retrieve (src/nodes.py)"]
+    RetrieveNode --> GradeNode["grade_documents (src/nodes.py)"]
+    GradeNode --> DecideNode{"decide_to_generate (src/graph.py)"}
 
-    %% DECISIONS
-    Decision{<b>Conditional Edge</b><br>Func: decide_to_generate<br>File: src/graph.py}
+    DecideNode -->|"documents non-empty"| GenerateNode["generate (src/nodes.py)"]
+    DecideNode -->|"documents empty AND retry_count <= MAX_RETRIES"| RewriteNode["rewrite_query (src/nodes.py)"]
+    DecideNode -->|"documents empty AND retry_count > MAX_RETRIES"| GenerateNode
 
-    %% EDGES
-    NodeRetrieve --> NodeGrade
-    NodeGrade --> Decision
-    
-    Decision -- "Documents Found" --> NodeGenerate
-    Decision -- "No Docs & Retry < 3" --> NodeRewrite
-    Decision -- "Give Up (Max Retries)" --> NodeGenerate
-    
-    NodeRewrite --> NodeRetrieve
-    NodeGenerate --> End([End of Stream])
-
-    %% STYLING
-    style NodeRetrieve fill:#e1f5fe,stroke:#01579b,stroke-width:2px
-    style NodeGrade fill:#fff9c4,stroke:#fbc02d,stroke-width:2px
-    style NodeRewrite fill:#ffcdd2,stroke:#c62828,stroke-width:2px
-    style NodeGenerate fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px
-    style Decision fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px,stroke-dasharray: 5 5
+    RewriteNode --> RetrieveNode
+    GenerateNode --> EndNode["End (final state)"]
 ```
+
+### Module responsibilities
+
+```mermaid
+flowchart LR
+    Main["main.py (CLI)"] --> Graph["src/graph.py build_graph()"]
+    UI["ui.py (Streamlit)"] --> Graph
+
+    Graph --> Nodes["src/nodes.py (node fns)"]
+    Graph --> State["src/state.py (GraphState)"]
+
+    Nodes --> Retriever["Chroma Retriever (persisted ./chroma_db)"]
+    Nodes --> LLM["ChatOpenAI (gpt-4o-mini)"]
+
+    UI --> LangSmith["LangSmith (collect_runs + tracing)"]
+    Nodes --> LangSmith
+```
+
+### State (GraphState) fields that drive behavior
+
+- `question`: original user question or rewritten query
+- `documents`: retrieved docs (then filtered by `grade_documents`)
+- `retry_count`: increments when *no* relevant docs are found, used to stop infinite loops
+- `generation`: final answer (set by `generate`)
+
+### Trace/debug fields (LangSmith-friendly, metadata-only)
+
+These fields are returned by nodes so you can inspect behavior in LangSmith without logging raw text:
+
+- `retrieved_docs_meta` (from `retrieve`): per-doc metadata (e.g., `source` URL) + index
+- `doc_grades` (from `grade_documents`): per-doc pass/fail + grade + metadata
+- `used_docs_meta` (from `generate`): metadata for the final docs used to answer

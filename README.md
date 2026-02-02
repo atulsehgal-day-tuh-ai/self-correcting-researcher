@@ -1,49 +1,28 @@
-# 🤖 Self-Correcting RAG Researcher
+## Self-Correcting Researcher (RAG + LangGraph + LangSmith + Streamlit)
 
-A "Smart" AI Agent capable of performing research, grading its own retrieved information, and **rewriting its search queries** if the initial results are irrelevant. Built with **LangGraph**, **LangChain**, and **ChromaDB**.
+This repo implements a **self-correcting RAG agent**:
+- It retrieves candidate context from a persistent vector store (Chroma).
+- It uses an LLM to **grade retrieval quality**.
+- If retrieval is bad, it **rewrites the query** and tries again (bounded retries).
+- Once enough relevant context exists (or we hit the retry limit), it **generates** a final answer.
 
-![Status](https://img.shields.io/badge/Status-Operational-green)
-![Python](https://img.shields.io/badge/Python-3.12-blue)
-![Stack](https://img.shields.io/badge/Stack-LangGraph%20%7C%20LangSmith%20%7C%20Streamlit-orange)
+The implementation is intentionally small so it’s easy to study and extend.
 
-## 🧠 The Architecture
-
-Unlike a standard chatbot that just retrieves and answers, this agent employs a **Self-Correction Loop**.
-
-```mermaid
-graph TD
-    %% NODES
-    Start([Start]) --> NodeRetrieve
-    
-    subgraph "The Learning Loop"
-        NodeRetrieve[<b>RETRIEVE</b><br>Fetch docs from VectorDB]
-        NodeGrade[<b>GRADE</b><br>Check relevance with LLM]
-        NodeRewrite[<b>REWRITE</b><br>Optimize query for better results]
-        NodeGenerate[<b>GENERATE</b><br>Synthesize final answer]
-    end
-
-    %% LOGIC
-    NodeRetrieve --> NodeGrade
-    NodeGrade -- "Documents are Relevant" --> NodeGenerate
-    NodeGrade -- "Documents are Irrelevant" --> NodeRewrite
-    NodeRewrite --> NodeRetrieve
-    
-    NodeGenerate --> End([End])
-
-    %% STYLING
-    style NodeRetrieve fill:#e1f5fe,stroke:#01579b,stroke-width:2px
-    style NodeGrade fill:#fff9c4,stroke:#fbc02d,stroke-width:2px
-    style NodeRewrite fill:#ffcdd2,stroke:#c62828,stroke-width:2px
-    style NodeGenerate fill:#c8e6c9,stroke:#2e7d32,stroke-width:2px
-```
+### Quick links
+- Architecture & flow diagrams: `diagram.md`
+- Streamlit UI: `ui.py`
+- CLI runner: `main.py`
+- Graph wiring: `src/graph.py`
+- Node logic: `src/nodes.py`
+- State model: `src/state.py`
 
 ---
 
-## 📂 Project Structure
+## Project structure
 
 ```text
 self-correcting-researcher/
-├── chromadb/               # Persistent Vector Database (Generated automatically)
+├── chroma_db/              # Persistent Vector DB (generated at runtime; not committed)
 ├── src/
 │   ├── graph.py            # The "Brain": Defines the workflow and decision logic
 │   ├── nodes.py            # The "Muscles": Actual functions (Search, Grade, Write)
@@ -57,39 +36,25 @@ self-correcting-researcher/
 
 ---
 
-## 🛠️ Module & Function Breakdown
+## Architecture & code flow
 
-### 1. `src/state.py` (The Memory)
-Defines the `GraphState` dictionary. This is the packet of data that moves between every node.
-* **`question`**: The user's input (can be rewritten by the agent).
-* **`generation`**: The final answer string.
-* **`documents`**: A list of retrieved `Document` objects.
-* **`retry_count`**: Tracks loop iterations to prevent infinite cycles.
+The workflow is defined in `src/graph.py` and uses four nodes implemented in `src/nodes.py`:
 
-### 2. `src/nodes.py` (The Actions)
-Contains the core logic functions.
-* **`get_retriever()`**: Initializes ChromaDB with a "Lazy Loading" pattern. It builds the DB from Lilian Weng's blog only if it doesn't already exist on disk.
-* **`retrieve(state)`**: Queries ChromaDB for the top 4 documents matching the current `question`.
-* **`grade_documents(state)`**: Uses GPT-4o to evaluate if retrieved docs are actually relevant. Filters out the "trash."
-* **`rewrite_query(state)`**: If grading fails, this transforms the original question into a better search query using semantic reasoning.
-* **`generate(state)`**: Takes the validated documents and synthesizes a final answer.
+- **retrieve**: get candidate chunks from Chroma
+- **grade_documents**: LLM relevance filter (per-chunk yes/no)
+- **rewrite_query**: query optimizer used only when retrieval is bad
+- **generate**: final answer generation (RAG)
 
-### 3. `src/graph.py` (The Workflow)
-Orchestrates the flow.
-* **`build_graph()`**: Connects the nodes using LangGraph.
-* **`decide_to_generate(state)`**: The Conditional Edge logic.
-    * *If docs found:* -> Go to Generate.
-    * *If no docs & retries available:* -> Go to Rewrite Query.
-    * *If no docs & max retries hit:* -> Give up and Generate.
+See `diagram.md` for diagrams and detailed notes.
 
 ---
 
-## 🚀 How to Run
+## How to run
 
 ### Prerequisites
-* Python 3.12+
-* OpenAI API Key
-* LangSmith API Key (Optional, but recommended for debugging)
+- Python 3.12.x (repo is pinned to 3.12 in `pyproject.toml`)
+- OpenAI API key
+- LangSmith API key (optional, but recommended)
 
 ### 1. Installation
 Clone the repository and install dependencies using `uv` (recommended) or `pip`.
@@ -108,21 +73,27 @@ Create a `.env` file in the root directory:
 ```bash
 OPENAI_API_KEY=sk-proj-your-key...
 LANGCHAIN_TRACING_V2=true
-LANGCHAIN_ENDPOINT="[https://api.smith.langchain.com](https://api.smith.langchain.com)"
+LANGCHAIN_ENDPOINT=https://api.smith.langchain.com
 LANGCHAIN_API_KEY=lsv2-your-key...
 LANGCHAIN_PROJECT="Self-Correcting-Researcher"
 ```
 
 ### 3. Execution
 
-**Option A: The Web UI (Streamlit)**
+#### Option A: Web UI (Streamlit)
 This provides a visual interface with a "Thinking Waterfall" and direct links to LangSmith traces.
 
 ```bash
 streamlit run ui.py
 ```
 
-**Option B: The CLI (Terminal)**
+If `streamlit run ui.py` fails on Windows with **"Failed to canonicalize script path"**, use:
+
+```bash
+python -m streamlit run .\ui.py
+```
+
+#### Option B: CLI (Terminal)
 Runs the agent in the command line for quick testing.
 
 ```bash
@@ -131,7 +102,26 @@ python main.py
 
 ---
 
-## 🐛 Troubleshooting
+## LangSmith (tracing + how to interpret runs)
+
+If `LANGCHAIN_TRACING_V2=true` and `LANGCHAIN_API_KEY` are set, LangSmith will capture a trace per run.
+
+### What you’ll see in the trace
+- A top-level **LangGraph** run for the whole execution
+- Child runs for each node (`retrieve`, `grade_documents`, `rewrite_query`, `generate`)
+- Nested runs inside nodes (e.g., `VectorStoreRetriever`, `ChatOpenAI`)
+
+### Debug fields emitted by this repo (metadata-only)
+To make the agent behavior easier to understand, node outputs include additional **metadata-only** fields:
+- `retrieved_docs_meta` (from `retrieve`): per-doc metadata (often includes `source`)
+- `doc_grades` (from `grade_documents`): per-doc pass/fail + grade + metadata
+- `used_docs_meta` (from `generate`): metadata for docs actually used in the final answer
+
+These appear in the **Outputs** panel when you click each node run in LangSmith.
+
+---
+
+## Troubleshooting
 
 **Blank Screen in UI?**
 If the Streamlit app stays blank, the vector database might be downloading in the background. Check your terminal for progress logs.
