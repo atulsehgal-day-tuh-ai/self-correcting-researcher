@@ -145,7 +145,8 @@ if submitted and text:
                 border-radius: 6px; 
                 padding: 5px 10px; 
                 cursor: pointer; 
-                font-weight: 600;">
+                font-weight: 600;
+                color: #111111;">
                 🔍 View Debug Trace in LangSmith
             </button>
         </a>
